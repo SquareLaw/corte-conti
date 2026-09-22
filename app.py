@@ -141,6 +141,22 @@ async def diagnose_search(q: str = "accesso agli atti appalti"):
             """)
             result["custom_tag_counts"] = custom_tag_counts
 
+            # app-cmp-pag-table-cdc appeared exactly once - likely the
+            # results table wrapper. Look inside it for actual rows.
+            table_inspection = await page.evaluate("""
+                () => {
+                    const container = document.querySelector('app-cmp-pag-table-cdc');
+                    if (!container) return {found: false};
+                    const rows = container.querySelectorAll('tr');
+                    const sample = [];
+                    for (let i = 0; i < Math.min(rows.length, 3); i++) {
+                        sample.push(rows[i].outerHTML.slice(0, 1500));
+                    }
+                    return {found: true, row_count: rows.length, sample_rows_html: sample};
+                }
+            """)
+            result["table_inspection"] = table_inspection
+
             result["page_text_preview"] = (await page.inner_text("body"))[:4000]
 
             await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)

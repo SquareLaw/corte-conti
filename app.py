@@ -217,6 +217,89 @@ async def diagnose_all(q: str = "accesso agli atti appalti"):
     return JSONResponse(result)
 
 
+@app.get("/extract_results")
+async def extract_results(q: str = "accesso agli atti appalti", n: int = 5):
+    """The real extraction loop: for each of the first n results, load the
+    search fresh, click into that specific result, and parse out the
+    structured fields we identified (Identificativo locale, Organo
+    emittente, Tipo deliberazione, Descrizione, Testo provvedimento).
+
+    Re-runs the search per result rather than trying to navigate 'back'
+    from the document viewer, since we don't yet know a reliable way to
+    do that in this Angular app - slower, but much less likely to break.
+    """
+    import re
+
+    extracted = []
+    errors = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+
+        for i in range(n):
+            page = await browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            try:
+                await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+                await page.fill("#inputRicerca", q)
+                await page.click("#buttonSearch")
+                await page.wait_for_timeout(4000)
+
+                detail_buttons = page.locator(
+                    'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
+                )
+                count = await detail_buttons.count()
+                if i >= count:
+                    errors.append(f"Result {i}: only {count} results available on this page")
+                    break
+
+                await detail_buttons.nth(i).click()
+                await page.wait_for_timeout(3000)
+
+                full_text = await page.inner_text("body")
+
+                def extract_field(label, next_label, text):
+                    pattern = re.escape(label) + r"\s*\n+(.*?)\n+\s*" + re.escape(next_label)
+                    match = re.search(pattern, text, re.DOTALL)
+                    return match.group(1).strip() if match else None
+
+                identificativo = extract_field("Identificativo locale", "Organo emittente", full_text)
+                organo = extract_field("Organo emittente", "Attiva riferimenti", full_text)
+                tipo = extract_field("TIPO DELIBERAZIONE", "DESCRIZIONE", full_text)
+                descrizione = extract_field("DESCRIZIONE", "TESTO PROVVEDIMENTO", full_text)
+
+                testo_match = re.search(r"TESTO PROVVEDIMENTO\s*\n+(.*)", full_text, re.DOTALL)
+                testo = testo_match.group(1).strip() if testo_match else None
+
+                extracted.append({
+                    "result_index": i,
+                    "identificativo_locale": identificativo,
+                    "organo_emittente": organo,
+                    "tipo_deliberazione": tipo,
+                    "descrizione": descrizione,
+                    "testo_provvedimento_length": len(testo) if testo else 0,
+                    "testo_provvedimento_preview": testo[:500] if testo else None,
+                    "parse_succeeded": bool(identificativo or organo or testo),
+                })
+
+            except Exception as e:
+                errors.append(f"Result {i}: {str(e)}")
+            finally:
+                await page.close()
+
+        await browser.close()
+
+    return JSONResponse({
+        "query": q,
+        "requested": n,
+        "extracted_count": len(extracted),
+        "results": extracted,
+        "errors": errors,
+    })
+
+
 @app.get("/screenshot/{n}")
 def screenshot(n: int):
     paths = {1: SCREENSHOT_1, 2: SCREENSHOT_2, 3: SCREENSHOT_3}

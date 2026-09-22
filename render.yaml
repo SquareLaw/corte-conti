@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: corteconti-diagnostic
+    env: docker
+    plan: free
+    # Switched from env: python to env: docker, using the Dockerfile in
+    # this repo. The Playwright browser + its system dependencies are
+    # already baked into Microsoft's official base image, which avoids
+    # the root-access build failure we hit with `playwright install
+    # --with-deps` on Render's standard Python build.
+    dockerfilePath: ./Dockerfile

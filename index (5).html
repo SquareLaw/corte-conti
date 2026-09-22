@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Ricerca Corte dei Conti</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<style>
+  body { font-family: sans-serif; max-width: 780px; margin: 40px auto; padding: 0 16px; }
+  textarea { width: 100%; height: 60px; font-size: 15px; padding: 8px; }
+  select { padding: 6px; font-size: 14px; margin-left: 8px; }
+  button { padding: 10px 20px; font-size: 15px; margin-top: 10px; cursor: pointer; }
+  #status { margin-top: 16px; color: #888; font-size: 14px; }
+  #summary { margin-top: 20px; line-height: 1.5; }
+  #summary h2, #summary h3 { color: #2a2a6a; }
+  #summary hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+  .note { font-size: 13px; color: #999; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h2>Ricerca giurisprudenza - Corte dei Conti</h2>
+  <p>Cerca nel portale ufficiale (banchedati.corteconti.it) in tempo reale. Ogni ricerca interroga il sito live - nessun dato viene conservato qui.</p>
+
+  <textarea id="query" placeholder="Scrivi la tua domanda di ricerca..."></textarea>
+  <div>
+    Numero di risultati da analizzare:
+    <select id="numResults">
+      <option value="3">3 (piu' veloce)</option>
+      <option value="5" selected>5 (consigliato)</option>
+    </select>
+  </div>
+  <button onclick="cercaOra()">Cerca</button>
+  <p class="note">Una ricerca con 5 risultati richiede circa 2-3 minuti. Non chiudere la pagina.</p>
+
+  <div id="status"></div>
+  <div id="summary"></div>
+
+<script>
+let pollTimer = null;
+
+async function cercaOra() {
+  const query = document.getElementById('query').value.trim();
+  const n = document.getElementById('numResults').value;
+  if (!query) return;
+
+  document.getElementById('summary').innerHTML = '';
+  document.getElementById('status').textContent = 'Avvio della ricerca...';
+  if (pollTimer) clearInterval(pollTimer);
+
+  const resp = await fetch(`/start_search?q=${encodeURIComponent(query)}&n=${n}`);
+  const data = await resp.json();
+
+  if (!data.job_id) {
+    document.getElementById('status').textContent = 'Errore nell\'avvio della ricerca.';
+    return;
+  }
+
+  pollJob(data.job_id);
+}
+
+function pollJob(jobId) {
+  const statusLabels = {
+    'queued': 'In coda...',
+    'extracting': 'Estrazione dei documenti dal portale in corso...',
+    'summarizing': 'Analisi e sintesi dei documenti in corso...',
+    'done': 'Completato.',
+    'failed': 'La ricerca non e\' andata a buon fine.'
+  };
+
+  pollTimer = setInterval(async () => {
+    try {
+      const resp = await fetch(`/job_status/${jobId}`);
+      if (!resp.ok) {
+        document.getElementById('status').textContent = 'Sessione persa (il server potrebbe essersi riavviato) - riprova la ricerca.';
+        clearInterval(pollTimer);
+        return;
+      }
+      const job = await resp.json();
+      document.getElementById('status').textContent = statusLabels[job.status] || job.status;
+
+      if (job.status === 'done') {
+        clearInterval(pollTimer);
+        renderSummary(job.result);
+      } else if (job.status === 'failed') {
+        clearInterval(pollTimer);
+        document.getElementById('status').textContent = 'Errore: ' + (job.error || 'sconosciuto') + '. Riprova.';
+      }
+    } catch (e) {
+      document.getElementById('status').textContent = 'Errore di connessione - riprovo...';
+    }
+  }, 8000);
+}
+
+function renderSummary(result) {
+  document.getElementById('status').textContent =
+    `Analizzati ${result.documents_extracted} documenti.`;
+  document.getElementById('summary').innerHTML = marked.parse(result.summary || '');
+}
+</script>
+</body>
+</html>

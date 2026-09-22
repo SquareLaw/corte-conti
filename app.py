@@ -157,38 +157,56 @@ async def diagnose_all(q: str = "accesso agli atti appalti"):
             }
         """), {})
 
-        # --- 5. Attempt to actually click a plausible row and see what happens ---
-        # Try the most likely candidates in order; report which (if any) worked.
-        click_attempt = {"tried_selectors": [], "success": False}
-        candidate_selectors = [
-            "app-cmp-pag-table-cdc tr:nth-child(2)",
-            "app-cmp-pag-table-cdc tbody tr:first-child",
-            "[mat-row]:first-child",
-            "app-cnt-results tr:nth-child(2)",
-        ]
-        for sel in candidate_selectors:
-            click_attempt["tried_selectors"].append(sel)
-            try:
-                el = await page.query_selector(sel)
-                if not el:
-                    continue
+        # --- 5. Click the real "Vai al dettaglio" button (not the row itself) ---
+        click_attempt = {"success": False}
+        try:
+            detail_button = await page.query_selector(
+                'app-cmp-pag-table-cdc button[title="Vai al dettaglio"]'
+            )
+            if detail_button:
                 url_before = page.url
-                await el.click(timeout=5000)
-                await page.wait_for_timeout(3000)
-                url_after = page.url
+                # Watch for either: (a) a new tab opening, or (b) a file download
+                # starting - either is plausible for a "view document" action
+                popup_promise = page.context.wait_for_event("page", timeout=8000)
+                download_promise = page.wait_for_event("download", timeout=8000)
+
+                await detail_button.click()
+                await page.wait_for_timeout(2000)
+
                 click_attempt["success"] = True
-                click_attempt["selector_used"] = sel
                 click_attempt["url_before"] = url_before
-                click_attempt["url_after"] = url_after
-                click_attempt["url_changed"] = url_before != url_after
-                click_attempt["page_text_after_click"] = (await page.inner_text("body"))[:2000]
-                await page.screenshot(path=SCREENSHOT_3, full_page=True)
-                result["screenshot_3_available"] = True
-                break
-            except Exception as e:
-                click_attempt[f"error_for_{sel}"] = str(e)
+                click_attempt["url_after_same_page"] = page.url
+
+                # Check if a new tab/popup opened
+                try:
+                    popup = await popup_promise
+                    await popup.wait_for_load_state(timeout=8000)
+                    click_attempt["opened_new_tab"] = True
+                    click_attempt["new_tab_url"] = popup.url
+                    click_attempt["new_tab_title"] = await popup.title()
+                    click_attempt["new_tab_text_preview"] = (await popup.inner_text("body"))[:2000]
+                except Exception:
+                    click_attempt["opened_new_tab"] = False
+
+                # Check if a download started instead
+                try:
+                    download = await download_promise
+                    click_attempt["triggered_download"] = True
+                    click_attempt["download_filename"] = download.suggested_filename
+                    click_attempt["download_url"] = download.url
+                except Exception:
+                    click_attempt["triggered_download"] = False
+            else:
+                click_attempt["error"] = "Could not find the 'Vai al dettaglio' button"
+        except Exception as e:
+            click_attempt["error"] = str(e)
+
+        try:
+            await page.screenshot(path=SCREENSHOT_3, full_page=True)
+            result["screenshot_3_available"] = True
+        except Exception:
+            result["screenshot_3_available"] = False
         result["click_attempt"] = click_attempt
-        result.setdefault("screenshot_3_available", False)
 
         result["page_text_preview"] = await safe(page.inner_text("body"), "")
         if isinstance(result["page_text_preview"], str):

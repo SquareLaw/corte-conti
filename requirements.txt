@@ -1,4 +1,3 @@
 fastapi
 uvicorn
 playwright==1.63.0
-anthropic

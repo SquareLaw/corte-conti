@@ -245,7 +245,14 @@ async def extract_results(q: str = "accesso agli atti appalti", n: int = 5):
                 await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
                 await page.fill("#inputRicerca", q)
                 await page.click("#buttonSearch")
-                await page.wait_for_timeout(4000)
+
+                # Wait for actual result rows to appear, rather than a fixed
+                # delay - a fresh browser context (no cache) can be slower
+                # to render than the warmed-up session used in earlier tests.
+                await page.wait_for_selector(
+                    'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
+                    timeout=20000
+                )
 
                 detail_buttons = page.locator(
                     'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
@@ -256,7 +263,14 @@ async def extract_results(q: str = "accesso agli atti appalti", n: int = 5):
                     break
 
                 await detail_buttons.nth(i).click()
-                await page.wait_for_timeout(3000)
+
+                # Wait for the actual document viewer content to appear,
+                # not just a fixed delay
+                try:
+                    await page.wait_for_selector("text=Identificativo locale", timeout=15000)
+                except Exception:
+                    pass  # fall through - extraction below will report if text truly never appeared
+                await page.wait_for_timeout(1000)  # brief settle time after content appears
 
                 full_text = await page.inner_text("body")
 

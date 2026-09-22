@@ -15,6 +15,8 @@ Diagnostic endpoints kept for troubleshooting: /diagnose_all, /screenshot/N
 
 import os
 import re
+import uuid
+import asyncio
 from playwright.async_api import async_playwright
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, FileResponse
@@ -28,6 +30,11 @@ SCREENSHOT_1 = "/tmp/screenshot_1_initial.png"
 SCREENSHOT_2 = "/tmp/screenshot_2_after_search.png"
 SCREENSHOT_3 = "/tmp/screenshot_3_after_click.png"
 MAX_CHARS_PER_DOC = 6000  # cap sent to Claude - keeps cost bounded per search
+
+# In-memory job store. Fine for a single-instance prototype; a real
+# deployment with multiple server instances would need a shared store
+# (e.g. a database row) instead, since each instance has its own memory.
+JOBS = {}
 
 
 async def safe(coro, default=None):
@@ -116,59 +123,105 @@ async def extract_results(q: str, n: int) -> dict:
     return {"extracted": extracted, "errors": errors}
 
 
+async def run_search_job(job_id: str, q: str, n: int):
+    """The actual work, run in the background - not tied to any single
+    HTTP request's lifetime, so it can take as long as it needs."""
+    try:
+        JOBS[job_id]["status"] = "extracting"
+        extraction = await extract_results(q, n)
+        docs = extraction["extracted"]
+
+        if not docs:
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["result"] = {
+                "query": q,
+                "summary": "Nessun documento estratto.",
+                "extraction_errors": extraction["errors"],
+            }
+            return
+
+        JOBS[job_id]["status"] = "summarizing"
+        context_blocks = []
+        for d in docs:
+            riferimento = d["identificativo_locale"] or f"documento {d['result_index']} (riferimento non estratto automaticamente - vedi testo)"
+            testo = d["testo_completo"][:MAX_CHARS_PER_DOC]
+            context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]\n{testo}")
+        context = "\n\n---\n\n".join(context_blocks)
+
+        system_prompt = (
+            "Sei un assistente di ricerca giuridica specializzato nei provvedimenti "
+            "della Corte dei Conti (sezioni di controllo e sezioni giurisdizionali). "
+            "Ti vengono forniti alcuni documenti recuperati dal motore di ricerca "
+            "ufficiale del portale banchedati.corteconti.it, in risposta alla "
+            "domanda dell'utente. Il motore di ricerca del portale a volte "
+            "restituisce risultati non pertinenti insieme a quelli rilevanti - "
+            "il tuo compito e' filtrare.\n\n"
+            "Per ciascun documento:\n"
+            "1. Valuta se e' effettivamente pertinente alla domanda\n"
+            "2. Se PERTINENTE: ricava dal testo stesso un riferimento identificativo "
+            "(numero, sezione, tipo di atto - delibera o sentenza), scrivi una "
+            "sintesi di 2-3 frasi, e spiega perche' e' pertinente\n"
+            "3. Se NON pertinente (anche solo marginalmente o indirettamente "
+            "collegato): SCARTALO SENZA RIASSUMERLO, indicando solo in una riga "
+            "il motivo dello scarto. Non usare categorie intermedie come "
+            "'parzialmente pertinente' - o il documento risponde davvero alla "
+            "domanda, o va scartato.\n\n"
+            "Rispondi ESCLUSIVAMENTE sulla base del testo fornito - non inventare "
+            "riferimenti o contenuti non presenti nei documenti."
+        )
+
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": f"{context}\n\nDomanda: {q}"}],
+        )
+        summary = "".join(block.text for block in response.content if block.type == "text")
+
+        JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["result"] = {
+            "query": q,
+            "documents_extracted": len(docs),
+            "summary": summary,
+            "extraction_errors": extraction["errors"],
+        }
+
+    except Exception as e:
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
+
+
+@app.get("/start_search")
+async def start_search(q: str, n: int = 5):
+    """Kicks off the search in the background and returns immediately with
+    a job id - use this instead of waiting on one long request."""
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued", "query": q, "n": n}
+    asyncio.create_task(run_search_job(job_id, q, n))
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "queued",
+        "check_status_at": f"/job_status/{job_id}",
+        "note": f"This will take roughly {n * 15}-{n * 25} seconds. Poll the status URL above every 15-20 seconds.",
+    })
+
+
+@app.get("/job_status/{job_id}")
+def job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Unknown job_id"}, status_code=404)
+    return JSONResponse(job)
+
+
 @app.get("/search")
 async def search(q: str, n: int = 5):
-    """The real endpoint: search, extract, filter+summarize via Claude."""
-    extraction = await extract_results(q, n)
-    docs = extraction["extracted"]
-
-    if not docs:
-        return JSONResponse({
-            "query": q,
-            "summary": "Nessun documento estratto - il motore di ricerca del portale non ha restituito risultati, o l'estrazione e' fallita.",
-            "extraction_errors": extraction["errors"],
-        })
-
-    context_blocks = []
-    for d in docs:
-        riferimento = d["identificativo_locale"] or f"documento {d['result_index']} (riferimento non estratto automaticamente - vedi testo)"
-        testo = d["testo_completo"][:MAX_CHARS_PER_DOC]
-        context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]\n{testo}")
-
-    context = "\n\n---\n\n".join(context_blocks)
-
-    system_prompt = (
-        "Sei un assistente di ricerca giuridica specializzato nei provvedimenti "
-        "della Corte dei Conti (sezioni di controllo e sezioni giurisdizionali). "
-        "Ti vengono forniti alcuni documenti recuperati dal motore di ricerca "
-        "ufficiale del portale banchedati.corteconti.it, in risposta alla "
-        "domanda dell'utente. Il motore di ricerca del portale a volte "
-        "restituisce risultati non pertinenti insieme a quelli rilevanti - "
-        "il tuo compito e' filtrare.\n\n"
-        "Per ciascun documento:\n"
-        "1. Valuta se e' effettivamente pertinente alla domanda\n"
-        "2. Se PERTINENTE: ricava dal testo stesso un riferimento identificativo "
-        "(numero, sezione, tipo di atto - delibera o sentenza), scrivi una "
-        "sintesi di 2-3 frasi, e spiega perche' e' pertinente\n"
-        "3. Se NON pertinente: scartalo, indicando in una riga il motivo\n\n"
-        "Rispondi ESCLUSIVAMENTE sulla base del testo fornito - non inventare "
-        "riferimenti o contenuti non presenti nei documenti."
-    )
-
-    response = claude_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1500,
-        system=system_prompt,
-        messages=[{"role": "user", "content": f"{context}\n\nDomanda: {q}"}],
-    )
-    summary = "".join(block.text for block in response.content if block.type == "text")
-
-    return JSONResponse({
-        "query": q,
-        "documents_extracted": len(docs),
-        "summary": summary,
-        "extraction_errors": extraction["errors"],
-    })
+    """Kept for small n where blocking is tolerable (n<=3 or so). For
+    anything larger, use /start_search + /job_status instead."""
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "queued", "query": q, "n": n}
+    await run_search_job(job_id, q, n)
+    return JSONResponse(JOBS[job_id])
 
 
 @app.get("/diagnose_all")
@@ -227,6 +280,12 @@ def screenshot(n: int):
 def home():
     return {
         "message": "Corte dei Conti search filter/summarizer",
-        "version": "v4-search-with-claude",
-        "endpoints": ["/search?q=...&n=5", "/diagnose_all", "/screenshot/1", "/screenshot/2"],
+        "version": "v5-async-jobs",
+        "endpoints": [
+            "/start_search?q=...&n=10  (use this for larger n - returns a job_id immediately)",
+            "/job_status/{job_id}  (poll this)",
+            "/search?q=...&n=3  (blocking, only for small n)",
+            "/diagnose_all",
+            "/screenshot/1", "/screenshot/2",
+        ],
     }

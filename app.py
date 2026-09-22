@@ -28,6 +28,7 @@ app = FastAPI()
 
 TARGET_URL = "https://banchedati.corteconti.it/"
 SCREENSHOT_PATH = "/tmp/diagnostic_screenshot.png"
+SEARCH_SCREENSHOT_PATH = "/tmp/search_screenshot.png"
 
 
 @app.get("/diagnose")
@@ -82,6 +83,58 @@ async def diagnose():
             await browser.close()
 
     return JSONResponse(result)
+
+
+@app.get("/diagnose_search")
+async def diagnose_search(q: str = "accesso agli atti appalti"):
+    """Runs one real search and reports what the results page looks like -
+    the next unknown after /diagnose confirmed the form itself works."""
+    result = {"target_url": TARGET_URL, "query": q}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+
+        try:
+            await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            await page.fill("#inputRicerca", q)
+            await page.click("#buttonSearch")
+
+            # Angular SPA - give it time to render results after the click,
+            # rather than trusting networkidle alone
+            await page.wait_for_timeout(4000)
+
+            # Any links pointing to an individual document - the pattern we
+            # saw earlier was /documentDetail/SEZIONE/NUMERO/ANNO/TIPO
+            doc_links = await page.eval_on_selector_all(
+                "a[href*='documentDetail']",
+                "els => els.map(e => ({href: e.href, text: e.innerText}))"
+            )
+            result["document_links_found"] = doc_links
+            result["document_links_count"] = len(doc_links)
+
+            result["page_text_preview"] = (await page.inner_text("body"))[:1500]
+
+            await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)
+            result["screenshot_available"] = True
+
+        except Exception as e:
+            result["error"] = str(e)
+            result["screenshot_available"] = False
+        finally:
+            await browser.close()
+
+    return JSONResponse(result)
+
+
+@app.get("/search_screenshot")
+def search_screenshot():
+    if os.path.exists(SEARCH_SCREENSHOT_PATH):
+        return FileResponse(SEARCH_SCREENSHOT_PATH, media_type="image/png")
+    return JSONResponse({"error": "No screenshot yet - call /diagnose_search first"}, status_code=404)
 
 
 @app.get("/screenshot")

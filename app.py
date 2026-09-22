@@ -148,7 +148,13 @@ async def diagnose_search(q: str = "accesso agli atti appalti"):
 
         except Exception as e:
             result["error"] = str(e)
-            result["screenshot_available"] = False
+            try:
+                await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)
+                result["screenshot_available"] = True
+                result["body_text_at_failure"] = (await page.inner_text("body"))[:2000]
+            except Exception as inner_e:
+                result["screenshot_available"] = False
+                result["screenshot_error"] = str(inner_e)
         finally:
             await browser.close()
 

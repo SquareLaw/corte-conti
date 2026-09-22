@@ -9,3 +9,6 @@ services:
     # the root-access build failure we hit with `playwright install
     # --with-deps` on Render's standard Python build.
     dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false  # set this manually in the Render dashboard - never commit real keys

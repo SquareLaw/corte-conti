@@ -107,16 +107,24 @@ async def diagnose_search(q: str = "accesso agli atti appalti"):
             # rather than trusting networkidle alone
             await page.wait_for_timeout(4000)
 
-            # Any links pointing to an individual document - the pattern we
-            # saw earlier was /documentDetail/SEZIONE/NUMERO/ANNO/TIPO
-            doc_links = await page.eval_on_selector_all(
-                "a[href*='documentDetail']",
-                "els => els.map(e => ({href: e.href, text: e.innerText}))"
+            # Broaden capture: don't assume the link pattern (that guess
+            # was wrong) - grab every real <a href> AND every element using
+            # Angular's routerLink, since Angular apps often use one instead
+            # of the other for "clickable result" elements.
+            all_links = await page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText.trim()}))"
+                ".filter(x => x.text)"
             )
-            result["document_links_found"] = doc_links
-            result["document_links_count"] = len(doc_links)
+            router_links = await page.eval_on_selector_all(
+                "[routerlink]",
+                "els => els.map(e => ({routerlink: e.getAttribute('routerlink'), "
+                "tag: e.tagName, text: e.innerText.trim()}))"
+            )
+            result["all_links_with_text"] = all_links[:40]  # cap for readability
+            result["router_links_found"] = router_links[:40]
 
-            result["page_text_preview"] = (await page.inner_text("body"))[:1500]
+            result["page_text_preview"] = (await page.inner_text("body"))[:4000]
 
             await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)
             result["screenshot_available"] = True

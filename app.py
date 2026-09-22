@@ -106,10 +106,32 @@ async def diagnose_all(q: str = "accesso agli atti appalti"):
                 if (!container) return {found: false};
                 const rows = container.querySelectorAll('tr');
                 const sample = [];
-                for (let i = 0; i < Math.min(rows.length, 3); i++) {
-                    sample.push(rows[i].outerHTML.slice(0, 1500));
+                for (let i = 0; i < Math.min(rows.length, 4); i++) {
+                    sample.push(rows[i].outerHTML);
                 }
-                return {found: true, row_count: rows.length, sample_rows_html: sample};
+                // Also specifically hunt for anything clickable inside the
+                // first real data row (row index 1, since 0 is the header)
+                let clickable_in_row = [];
+                if (rows.length > 1) {
+                    const dataRow = rows[1];
+                    const candidates = dataRow.querySelectorAll(
+                        'a, button, [routerlink], [role="button"], .cursor-pointer, i, svg, fa-icon'
+                    );
+                    clickable_in_row = Array.from(candidates).map(el => ({
+                        tag: el.tagName,
+                        class: el.className ? el.className.toString() : '',
+                        href: el.getAttribute ? el.getAttribute('href') : null,
+                        routerlink: el.getAttribute ? el.getAttribute('routerlink') : null,
+                        text: el.innerText ? el.innerText.trim() : '',
+                        title: el.getAttribute ? el.getAttribute('title') : null
+                    }));
+                }
+                return {
+                    found: true,
+                    row_count: rows.length,
+                    sample_rows_html: sample,
+                    clickable_elements_in_first_data_row: clickable_in_row
+                };
             }
         """), {"found": False})
 

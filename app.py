@@ -83,6 +83,24 @@ async def extract_results(q: str, n: int) -> dict:
                     errors.append(f"Result {i}: only {count} results available on this page")
                     break
 
+                # Capture the source document's real URL via the "Scarica
+                # allegato" (download) button BEFORE opening the in-app
+                # viewer - the viewer replaces this row's content, so this
+                # has to happen first, on the same page, to avoid a whole
+                # extra reload cycle.
+                fonte_url = None
+                try:
+                    download_buttons = page.locator(
+                        'app-cmp-pag-table-cdc tr.parent button[title^="Scarica allegato"]'
+                    )
+                    async with page.expect_download(timeout=8000) as download_info:
+                        await download_buttons.nth(i).click()
+                    download = await download_info.value
+                    fonte_url = download.url
+                    await download.cancel()
+                except Exception:
+                    pass  # not fatal - result still gets extracted, just without a source link
+
                 await detail_buttons.nth(i).click()
                 try:
                     await page.wait_for_selector("text=Identificativo locale", timeout=15000)
@@ -111,6 +129,7 @@ async def extract_results(q: str, n: int) -> dict:
                     "identificativo_locale": identificativo,
                     "organo_emittente": organo,
                     "testo_completo": testo,
+                    "fonte_url": fonte_url,
                 })
 
             except Exception as e:
@@ -145,7 +164,8 @@ async def run_search_job(job_id: str, q: str, n: int):
         for d in docs:
             riferimento = d["identificativo_locale"] or f"documento {d['result_index']} (riferimento non estratto automaticamente - vedi testo)"
             testo = d["testo_completo"][:MAX_CHARS_PER_DOC]
-            context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]\n{testo}")
+            fonte_line = f"\nLink al documento originale: {d['fonte_url']}" if d.get("fonte_url") else "\nLink al documento originale: non disponibile"
+            context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]{fonte_line}\n{testo}")
         context = "\n\n---\n\n".join(context_blocks)
 
         system_prompt = (
@@ -160,7 +180,10 @@ async def run_search_job(job_id: str, q: str, n: int):
             "1. Valuta se e' effettivamente pertinente alla domanda\n"
             "2. Se PERTINENTE: ricava dal testo stesso un riferimento identificativo "
             "(numero, sezione, tipo di atto - delibera o sentenza), scrivi una "
-            "sintesi di 2-3 frasi, e spiega perche' e' pertinente\n"
+            "sintesi di 2-3 frasi, e spiega perche' e' pertinente. Includi anche "
+            "il link al documento originale fornito (se disponibile) come link "
+            "markdown, es: [Apri il documento originale](URL) - se il link non "
+            "e' disponibile, dillo esplicitamente invece di ometterlo.\n"
             "3. Se NON pertinente (anche solo marginalmente o indirettamente "
             "collegato): SCARTALO SENZA RIASSUMERLO, indicando solo in una riga "
             "il motivo dello scarto. Non usare categorie intermedie come "
@@ -222,6 +245,61 @@ async def search(q: str, n: int = 5):
     JOBS[job_id] = {"status": "queued", "query": q, "n": n}
     await run_search_job(job_id, q, n)
     return JSONResponse(JOBS[job_id])
+
+
+@app.get("/inspect_dropdowns")
+async def inspect_dropdowns():
+    """One-off diagnostic: open every dropdown on the search form (Angular
+    Material 'mat-select' components) and capture their option lists -
+    specifically looking for the 'Tutte le banche dati' selector, which may
+    let us restrict a search to only Giurisdizione or only Controllo."""
+    result = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        try:
+            await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            await page.wait_for_timeout(2000)
+
+            selects = page.locator("mat-select")
+            count = await selects.count()
+            result["mat_select_count"] = count
+
+            dropdowns = []
+            for i in range(count):
+                entry = {"index": i}
+                try:
+                    select_el = selects.nth(i)
+                    entry["visible_text"] = await select_el.inner_text()
+                    await select_el.click()
+                    await page.wait_for_timeout(500)
+
+                    # mat-option panels render in a CDK overlay, often
+                    # appended near the end of <body>, not nested inside
+                    # the select itself - so query the whole page for them.
+                    options = await page.eval_on_selector_all(
+                        "mat-option",
+                        "els => els.map(e => e.innerText.trim())"
+                    )
+                    entry["options"] = options
+
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(300)
+                except Exception as e:
+                    entry["error"] = str(e)
+                dropdowns.append(entry)
+
+            result["dropdowns"] = dropdowns
+
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            await browser.close()
+
+    return JSONResponse(result)
 
 
 @app.get("/diagnose_all")

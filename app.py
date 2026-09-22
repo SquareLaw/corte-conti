@@ -45,11 +45,15 @@ async def safe(coro, default=None):
         return {"error": str(e)} if default is None else default
 
 
-async def extract_results(q: str, n: int) -> dict:
+async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dati") -> dict:
     """Core extraction loop: for each of the first n results, load the
     search fresh, click into that specific result, and grab the full text.
     Re-runs the search per result rather than navigating 'back' from the
-    document viewer, since no reliable back-navigation method is known yet."""
+    document viewer, since no reliable back-navigation method is known yet.
+
+    banca_dati: one of "Tutte le banche dati", "Giurisdizione", "Controllo" -
+    filters at the source via the site's own dropdown, confirmed to exist
+    via /inspect_dropdowns."""
     extracted = []
     errors = []
 
@@ -63,6 +67,16 @@ async def extract_results(q: str, n: int) -> dict:
             )
             try:
                 await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+
+                if banca_dati != "Tutte le banche dati":
+                    try:
+                        await page.locator("mat-select").nth(0).click()
+                        await page.wait_for_timeout(500)
+                        await page.locator("mat-option", has_text=banca_dati).click()
+                        await page.wait_for_timeout(500)
+                    except Exception as e:
+                        errors.append(f"Could not set banca_dati filter to '{banca_dati}': {e}")
+
                 await page.fill("#inputRicerca", q)
                 await page.click("#buttonSearch")
 
@@ -142,12 +156,12 @@ async def extract_results(q: str, n: int) -> dict:
     return {"extracted": extracted, "errors": errors}
 
 
-async def run_search_job(job_id: str, q: str, n: int):
+async def run_search_job(job_id: str, q: str, n: int, banca_dati: str = "Tutte le banche dati"):
     """The actual work, run in the background - not tied to any single
     HTTP request's lifetime, so it can take as long as it needs."""
     try:
         JOBS[job_id]["status"] = "extracting"
-        extraction = await extract_results(q, n)
+        extraction = await extract_results(q, n, banca_dati)
         docs = extraction["extracted"]
 
         if not docs:
@@ -215,12 +229,12 @@ async def run_search_job(job_id: str, q: str, n: int):
 
 
 @app.get("/start_search")
-async def start_search(q: str, n: int = 5):
+async def start_search(q: str, n: int = 5, banca_dati: str = "Tutte le banche dati"):
     """Kicks off the search in the background and returns immediately with
     a job id - use this instead of waiting on one long request."""
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "queued", "query": q, "n": n}
-    asyncio.create_task(run_search_job(job_id, q, n))
+    JOBS[job_id] = {"status": "queued", "query": q, "n": n, "banca_dati": banca_dati}
+    asyncio.create_task(run_search_job(job_id, q, n, banca_dati))
     return JSONResponse({
         "job_id": job_id,
         "status": "queued",
@@ -238,12 +252,12 @@ def job_status(job_id: str):
 
 
 @app.get("/search")
-async def search(q: str, n: int = 5):
+async def search(q: str, n: int = 5, banca_dati: str = "Tutte le banche dati"):
     """Kept for small n where blocking is tolerable (n<=3 or so). For
     anything larger, use /start_search + /job_status instead."""
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "queued", "query": q, "n": n}
-    await run_search_job(job_id, q, n)
+    JOBS[job_id] = {"status": "queued", "query": q, "n": n, "banca_dati": banca_dati}
+    await run_search_job(job_id, q, n, banca_dati)
     return JSONResponse(JOBS[job_id])
 
 

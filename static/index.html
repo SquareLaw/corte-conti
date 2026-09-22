@@ -28,6 +28,14 @@
       <option value="5" selected>5 (consigliato)</option>
     </select>
   </div>
+  <div style="margin-top: 8px;">
+    Banca dati:
+    <select id="bancaDati">
+      <option value="Tutte le banche dati" selected>Tutte (Giurisdizione + Controllo)</option>
+      <option value="Giurisdizione">Solo Giurisdizione</option>
+      <option value="Controllo">Solo Controllo</option>
+    </select>
+  </div>
   <button onclick="cercaOra()">Cerca</button>
   <p class="note">Una ricerca con 5 risultati richiede circa 2-3 minuti. Non chiudere la pagina.</p>
 
@@ -40,13 +48,14 @@ let pollTimer = null;
 async function cercaOra() {
   const query = document.getElementById('query').value.trim();
   const n = document.getElementById('numResults').value;
+  const bancaDati = document.getElementById('bancaDati').value;
   if (!query) return;
 
   document.getElementById('summary').innerHTML = '';
   document.getElementById('status').textContent = 'Avvio della ricerca...';
   if (pollTimer) clearInterval(pollTimer);
 
-  const resp = await fetch(`/start_search?q=${encodeURIComponent(query)}&n=${n}`);
+  const resp = await fetch(`/start_search?q=${encodeURIComponent(query)}&n=${n}&banca_dati=${encodeURIComponent(bancaDati)}`);
   const data = await resp.json();
 
   if (!data.job_id) {

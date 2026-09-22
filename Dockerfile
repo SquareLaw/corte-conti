@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY static/ static/
 
 # Render sets $PORT at runtime; default to 10000 for local testing
 ENV PORT=10000

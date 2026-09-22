@@ -124,6 +124,23 @@ async def diagnose_search(q: str = "accesso agli atti appalti"):
             result["all_links_with_text"] = all_links[:40]  # cap for readability
             result["router_links_found"] = router_links[:40]
 
+            # Angular custom components always use hyphenated tag names
+            # (web component standard). Counting these tells us which
+            # element repeats ~100 times - a strong signal for "this is
+            # the individual result card", since the page shows 100 results
+            # loaded. Much more reliable than guessing at text boundaries.
+            custom_tag_counts = await page.evaluate("""
+                () => {
+                    const counts = {};
+                    document.querySelectorAll('*').forEach(el => {
+                        const tag = el.tagName.toLowerCase();
+                        if (tag.includes('-')) counts[tag] = (counts[tag] || 0) + 1;
+                    });
+                    return counts;
+                }
+            """)
+            result["custom_tag_counts"] = custom_tag_counts
+
             result["page_text_preview"] = (await page.inner_text("body"))[:4000]
 
             await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)

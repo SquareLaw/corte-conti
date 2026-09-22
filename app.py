@@ -1,22 +1,9 @@
 """
-app.py - DIAGNOSTIC ONLY. This does not search anything yet.
+app.py - DIAGNOSTIC ONLY. Consolidated: runs every check we've built so
+far, plus backup hypotheses, in ONE pass - so we don't need another
+redeploy loop for each new idea.
 
-Purpose: answer two questions before writing any real scraping logic:
-  1. Does banchedati.corteconti.it block Render's server (like it blocked
-     this environment's own fetch attempts), or does a real Playwright
-     browser get through where a plain HTTP request didn't?
-  2. What does the actual search form look like (field names, button
-     selectors) - so the next version can use real selectors instead
-     of guesses.
-
-Visit /diagnose on the deployed app to run the check. It returns:
-  - whether the page loaded at all (or got blocked/errored)
-  - the page title (a quick sanity check)
-  - a list of every <input> and <button> found on the page, with their
-    name/id/placeholder attributes - this is what tells us the real
-    field names to use for an actual search
-  - a screenshot, saved and served back, so you can SEE what loaded
-    (useful if it's a CAPTCHA/block page rather than the real search form)
+Visit /diagnose_all to run everything at once.
 """
 
 import os
@@ -27,68 +14,21 @@ from fastapi.responses import JSONResponse, FileResponse
 app = FastAPI()
 
 TARGET_URL = "https://banchedati.corteconti.it/"
-SCREENSHOT_PATH = "/tmp/diagnostic_screenshot.png"
-SEARCH_SCREENSHOT_PATH = "/tmp/search_screenshot.png"
+SCREENSHOT_1 = "/tmp/screenshot_1_initial.png"
+SCREENSHOT_2 = "/tmp/screenshot_2_after_search.png"
+SCREENSHOT_3 = "/tmp/screenshot_3_after_click.png"
 
 
-@app.get("/diagnose")
-async def diagnose():
-    result = {"target_url": TARGET_URL}
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-
-        try:
-            response = await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
-            result["http_status"] = response.status if response else None
-            result["page_title"] = await page.title()
-
-            # Give any client-side rendering a moment to finish
-            await page.wait_for_timeout(2000)
-
-            # Collect every input and button on the page - this is the
-            # real form structure, not a guess
-            inputs = await page.eval_on_selector_all(
-                "input",
-                "els => els.map(e => ({tag: 'input', type: e.type, name: e.name, "
-                "id: e.id, placeholder: e.placeholder}))"
-            )
-            buttons = await page.eval_on_selector_all(
-                "button, input[type=submit]",
-                "els => els.map(e => ({tag: e.tagName, id: e.id, "
-                "text: e.innerText || e.value}))"
-            )
-            result["inputs_found"] = inputs
-            result["buttons_found"] = buttons
-
-            # A quick heuristic flag for whether this looks like a block/
-            # CAPTCHA page rather than the real site
-            body_text = (await page.inner_text("body"))[:500]
-            result["body_text_preview"] = body_text
-            result["looks_blocked"] = any(
-                kw in body_text.lower() for kw in ["captcha", "access denied", "blocked", "forbidden"]
-            )
-
-            await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-            result["screenshot_available"] = True
-
-        except Exception as e:
-            result["error"] = str(e)
-            result["screenshot_available"] = False
-        finally:
-            await browser.close()
-
-    return JSONResponse(result)
+async def safe(coro, default=None):
+    """Run a diagnostic step without letting its failure kill the others."""
+    try:
+        return await coro
+    except Exception as e:
+        return {"error": str(e)} if default is None else default
 
 
-@app.get("/diagnose_search")
-async def diagnose_search(q: str = "accesso agli atti appalti"):
-    """Runs one real search and reports what the results page looks like -
-    the next unknown after /diagnose confirmed the form itself works."""
+@app.get("/diagnose_all")
+async def diagnose_all(q: str = "accesso agli atti appalti"):
     result = {"target_url": TARGET_URL, "query": q}
 
     async with async_playwright() as p:
@@ -98,99 +38,154 @@ async def diagnose_search(q: str = "accesso agli atti appalti"):
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
 
+        # --- 1. Load the page ---
         try:
-            await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            response = await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            result["http_status"] = response.status if response else None
+            result["page_title"] = await page.title()
+            await page.wait_for_timeout(2000)
+            await page.screenshot(path=SCREENSHOT_1, full_page=True)
+            result["screenshot_1_available"] = True
+        except Exception as e:
+            result["load_error"] = str(e)
+            result["screenshot_1_available"] = False
+            await browser.close()
+            return JSONResponse(result)  # nothing else will work if this failed
+
+        # --- 2. Form structure ---
+        result["inputs_found"] = await safe(page.eval_on_selector_all(
+            "input",
+            "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
+        ), [])
+        result["buttons_found"] = await safe(page.eval_on_selector_all(
+            "button, input[type=submit]",
+            "els => els.map(e => ({id: e.id, text: e.innerText || e.value}))"
+        ), [])
+
+        # --- 3. Run the search ---
+        try:
             await page.fill("#inputRicerca", q)
             await page.click("#buttonSearch")
-
-            # Angular SPA - give it time to render results after the click,
-            # rather than trusting networkidle alone
             await page.wait_for_timeout(4000)
-
-            # Broaden capture: don't assume the link pattern (that guess
-            # was wrong) - grab every real <a href> AND every element using
-            # Angular's routerLink, since Angular apps often use one instead
-            # of the other for "clickable result" elements.
-            all_links = await page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText.trim()}))"
-                ".filter(x => x.text)"
-            )
-            router_links = await page.eval_on_selector_all(
-                "[routerlink]",
-                "els => els.map(e => ({routerlink: e.getAttribute('routerlink'), "
-                "tag: e.tagName, text: e.innerText.trim()}))"
-            )
-            result["all_links_with_text"] = all_links[:40]  # cap for readability
-            result["router_links_found"] = router_links[:40]
-
-            # Angular custom components always use hyphenated tag names
-            # (web component standard). Counting these tells us which
-            # element repeats ~100 times - a strong signal for "this is
-            # the individual result card", since the page shows 100 results
-            # loaded. Much more reliable than guessing at text boundaries.
-            custom_tag_counts = await page.evaluate("""
-                () => {
-                    const counts = {};
-                    document.querySelectorAll('*').forEach(el => {
-                        const tag = el.tagName.toLowerCase();
-                        if (tag.includes('-')) counts[tag] = (counts[tag] || 0) + 1;
-                    });
-                    return counts;
-                }
-            """)
-            result["custom_tag_counts"] = custom_tag_counts
-
-            # app-cmp-pag-table-cdc appeared exactly once - likely the
-            # results table wrapper. Look inside it for actual rows.
-            table_inspection = await page.evaluate("""
-                () => {
-                    const container = document.querySelector('app-cmp-pag-table-cdc');
-                    if (!container) return {found: false};
-                    const rows = container.querySelectorAll('tr');
-                    const sample = [];
-                    for (let i = 0; i < Math.min(rows.length, 3); i++) {
-                        sample.push(rows[i].outerHTML.slice(0, 1500));
-                    }
-                    return {found: true, row_count: rows.length, sample_rows_html: sample};
-                }
-            """)
-            result["table_inspection"] = table_inspection
-
-            result["page_text_preview"] = (await page.inner_text("body"))[:4000]
-
-            await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)
-            result["screenshot_available"] = True
-
+            result["search_submitted"] = True
+            await page.screenshot(path=SCREENSHOT_2, full_page=True)
+            result["screenshot_2_available"] = True
         except Exception as e:
-            result["error"] = str(e)
-            try:
-                await page.screenshot(path=SEARCH_SCREENSHOT_PATH, full_page=True)
-                result["screenshot_available"] = True
-                result["body_text_at_failure"] = (await page.inner_text("body"))[:2000]
-            except Exception as inner_e:
-                result["screenshot_available"] = False
-                result["screenshot_error"] = str(inner_e)
-        finally:
+            result["search_error"] = str(e)
+            result["search_submitted"] = False
+            result["screenshot_2_available"] = False
             await browser.close()
+            return JSONResponse(result)
+
+        # --- 4. Multiple hypotheses about where results live, all captured together ---
+        all_links = await safe(page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText.trim()}))"
+            ".filter(x => x.text)"
+        ), [])
+        result["all_links_with_text"] = all_links[:40] if isinstance(all_links, list) else all_links
+
+        result["custom_tag_counts"] = await safe(page.evaluate("""
+            () => {
+                const counts = {};
+                document.querySelectorAll('*').forEach(el => {
+                    const tag = el.tagName.toLowerCase();
+                    if (tag.includes('-')) counts[tag] = (counts[tag] || 0) + 1;
+                });
+                return counts;
+            }
+        """), {})
+
+        result["global_tr_count"] = await safe(page.evaluate(
+            "() => document.querySelectorAll('tr').length"
+        ), None)
+
+        result["table_cdc_inspection"] = await safe(page.evaluate("""
+            () => {
+                const container = document.querySelector('app-cmp-pag-table-cdc');
+                if (!container) return {found: false};
+                const rows = container.querySelectorAll('tr');
+                const sample = [];
+                for (let i = 0; i < Math.min(rows.length, 3); i++) {
+                    sample.push(rows[i].outerHTML.slice(0, 1500));
+                }
+                return {found: true, row_count: rows.length, sample_rows_html: sample};
+            }
+        """), {"found": False})
+
+        result["mat_row_count"] = await safe(page.evaluate(
+            "() => document.querySelectorAll('[mat-row], mat-row').length"
+        ), None)
+
+        result["cdk_virtual_scroll_items"] = await safe(page.evaluate(
+            "() => document.querySelectorAll('.cdk-virtual-scroll-content-wrapper > *').length"
+        ), None)
+
+        result["clickable_class_candidates"] = await safe(page.evaluate("""
+            () => {
+                const els = document.querySelectorAll(
+                    '[class*="result"], [class*="item"], [class*="card"], [class*="row"]'
+                );
+                const counts = {};
+                els.forEach(el => {
+                    const cls = el.className.toString();
+                    counts[cls] = (counts[cls] || 0) + 1;
+                });
+                return counts;
+            }
+        """), {})
+
+        # --- 5. Attempt to actually click a plausible row and see what happens ---
+        # Try the most likely candidates in order; report which (if any) worked.
+        click_attempt = {"tried_selectors": [], "success": False}
+        candidate_selectors = [
+            "app-cmp-pag-table-cdc tr:nth-child(2)",
+            "app-cmp-pag-table-cdc tbody tr:first-child",
+            "[mat-row]:first-child",
+            "app-cnt-results tr:nth-child(2)",
+        ]
+        for sel in candidate_selectors:
+            click_attempt["tried_selectors"].append(sel)
+            try:
+                el = await page.query_selector(sel)
+                if not el:
+                    continue
+                url_before = page.url
+                await el.click(timeout=5000)
+                await page.wait_for_timeout(3000)
+                url_after = page.url
+                click_attempt["success"] = True
+                click_attempt["selector_used"] = sel
+                click_attempt["url_before"] = url_before
+                click_attempt["url_after"] = url_after
+                click_attempt["url_changed"] = url_before != url_after
+                click_attempt["page_text_after_click"] = (await page.inner_text("body"))[:2000]
+                await page.screenshot(path=SCREENSHOT_3, full_page=True)
+                result["screenshot_3_available"] = True
+                break
+            except Exception as e:
+                click_attempt[f"error_for_{sel}"] = str(e)
+        result["click_attempt"] = click_attempt
+        result.setdefault("screenshot_3_available", False)
+
+        result["page_text_preview"] = await safe(page.inner_text("body"), "")
+        if isinstance(result["page_text_preview"], str):
+            result["page_text_preview"] = result["page_text_preview"][:3000]
+
+        await browser.close()
 
     return JSONResponse(result)
 
 
-@app.get("/search_screenshot")
-def search_screenshot():
-    if os.path.exists(SEARCH_SCREENSHOT_PATH):
-        return FileResponse(SEARCH_SCREENSHOT_PATH, media_type="image/png")
-    return JSONResponse({"error": "No screenshot yet - call /diagnose_search first"}, status_code=404)
-
-
-@app.get("/screenshot")
-def screenshot():
-    if os.path.exists(SCREENSHOT_PATH):
-        return FileResponse(SCREENSHOT_PATH, media_type="image/png")
-    return JSONResponse({"error": "No screenshot yet - call /diagnose first"}, status_code=404)
+@app.get("/screenshot/{n}")
+def screenshot(n: int):
+    paths = {1: SCREENSHOT_1, 2: SCREENSHOT_2, 3: SCREENSHOT_3}
+    path = paths.get(n)
+    if path and os.path.exists(path):
+        return FileResponse(path, media_type="image/png")
+    return JSONResponse({"error": f"No screenshot {n} yet - call /diagnose_all first"}, status_code=404)
 
 
 @app.get("/")
 def home():
-    return {"message": "Diagnostic app. Visit /diagnose to test the Corte dei Conti site, then /screenshot to see what loaded."}
+    return {"message": "Diagnostic app. Visit /diagnose_all to run every check in one pass, then /screenshot/1, /screenshot/2, /screenshot/3 to see each stage."}

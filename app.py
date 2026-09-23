@@ -311,10 +311,15 @@ async def inspect_citation_link(q: str = "accesso agli atti appalti"):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(
+        # Grant clipboard permissions - "Citazione estremi" likely copies
+        # the link to clipboard rather than displaying it, based on the
+        # last test (button clicked successfully, nothing changed on page).
+        context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            permissions=["clipboard-read", "clipboard-write"],
         )
+        page = await context.new_page()
         try:
             await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
             await page.fill("#inputRicerca", q)

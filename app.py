@@ -23,6 +23,16 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import anthropic
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def no_cache_headers(request, call_next):
+    """Prevent browsers from silently serving a cached (stale) response for
+    any GET request - this was the actual cause of seeing identical output
+    across multiple tests even after a real redeploy."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
 claude_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 TARGET_URL = "https://banchedati.corteconti.it/"
@@ -84,9 +94,6 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
             detail_buttons = page.locator(
                 'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
             )
-            download_buttons = page.locator(
-                'app-cmp-pag-table-cdc tr.parent button[title^="Scarica allegato"]'
-            )
 
             for i in range(n):
                 try:
@@ -111,16 +118,13 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                         errors.append(f"Result {i}: only {count} results available even after loading more")
                         break
 
-                    fonte_url = None
-                    fonte_url_error = None
-                    try:
-                        async with page.expect_download(timeout=8000) as download_info:
-                            await download_buttons.nth(i).click()
-                        download = await download_info.value
-                        fonte_url = download.url
-                        await download.cancel()
-                    except Exception as e:
-                        fonte_url_error = str(e)
+                    # Note: we no longer try to capture a "source link" via
+                    # the download button - it only produces a blob: URL,
+                    # which only works inside this same temporary browser
+                    # session and can never be opened by the person viewing
+                    # results. The Identificativo locale (extracted below)
+                    # is the real, usable reference - the same way a legal
+                    # citation works without needing a clickable URL.
 
                     await detail_buttons.nth(i).click()
                     try:
@@ -147,11 +151,7 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                         "identificativo_locale": identificativo,
                         "organo_emittente": organo,
                         "testo_completo": testo,
-                        "fonte_url": fonte_url,
-                        "fonte_url_error": fonte_url_error,
                     })
-                    if fonte_url_error:
-                        errors.append(f"Result {i}: source link capture failed - {fonte_url_error}")
 
                     # Return to the results list for the next result instead
                     # of reloading the whole search - the actual speed fix.
@@ -215,8 +215,7 @@ async def run_search_job(job_id: str, q: str, n: int, banca_dati: str = "Tutte l
         for d in docs:
             riferimento = d["identificativo_locale"] or f"documento {d['result_index']} (riferimento non estratto automaticamente - vedi testo)"
             testo = d["testo_completo"][:MAX_CHARS_PER_DOC]
-            fonte_line = f"\nLink al documento originale: {d['fonte_url']}" if d.get("fonte_url") else "\nLink al documento originale: non disponibile"
-            context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]{fonte_line}\n{testo}")
+            context_blocks.append(f"[Risultato {d['result_index']} - {riferimento}]\n{testo}")
         context = "\n\n---\n\n".join(context_blocks)
 
         system_prompt = (
@@ -231,10 +230,12 @@ async def run_search_job(job_id: str, q: str, n: int, banca_dati: str = "Tutte l
             "1. Valuta se e' effettivamente pertinente alla domanda\n"
             "2. Se PERTINENTE: ricava dal testo stesso un riferimento identificativo "
             "(numero, sezione, tipo di atto - delibera o sentenza), scrivi una "
-            "sintesi di 2-3 frasi, e spiega perche' e' pertinente. Includi anche "
-            "il link al documento originale fornito (se disponibile) come link "
-            "markdown, es: [Apri il documento originale](URL) - se il link non "
-            "e' disponibile, dillo esplicitamente invece di ometterlo.\n"
+            "sintesi di 2-3 frasi, e spiega perche' e' pertinente. Concludi sempre "
+            "indicando chiaramente l'Identificativo locale come riferimento per "
+            "ritrovare il documento sul portale ufficiale (es. 'Riferimento: "
+            "SRCLOM/137/2025/PREV - cercabile su banchedati.corteconti.it') - "
+            "NON includere link diretti al documento, poiche' non sono "
+            "utilizzabili al di fuori del portale stesso.\n"
             "3. Se NON pertinente (anche solo marginalmente o indirettamente "
             "collegato): SCARTALO SENZA RIASSUMERLO, indicando solo in una riga "
             "il motivo dello scarto. Non usare categorie intermedie come "
@@ -353,7 +354,24 @@ async def inspect_citation_link(q: str = "accesso agli atti appalti"):
 
             if await citazione_el.count() > 0:
                 try:
-                    await citazione_el.first.click()
+                    # Listen for network responses during the click - if
+                    # this button triggers an API call rather than a visible
+                    # UI change, the link might be in a response body we'd
+                    # otherwise never see.
+                    network_hits = []
+                    def on_response(response):
+                        network_hits.append(response.url)
+                    page.on("response", on_response)
+
+                    # Also try the PARENT element, not just the text itself -
+                    # in Angular apps an icon+label pair is often wrapped in
+                    # one clickable container, with the text alone being
+                    # non-interactive.
+                    parent_el = citazione_el.first.locator("xpath=..")
+                    try:
+                        await parent_el.click(timeout=3000)
+                    except Exception:
+                        await citazione_el.first.click()  # fallback to the original approach
 
                     # Check for a brief toast/confirmation popup right away,
                     # before it might disappear
@@ -371,17 +389,82 @@ async def inspect_citation_link(q: str = "accesso agli atti appalti"):
                     except Exception as e:
                         result["clipboard_read_error"] = str(e)
 
-                    await page.wait_for_timeout(1200)
-                    html_after = await page.content()
-                    uuids_found_after = list(set(uuid_pattern.findall(html_after)))
-                    result["uuids_in_html_after_clicking_citazione"] = uuids_found_after
-                    result["new_uuids_revealed"] = list(set(uuids_found_after) - set(uuids_found_before))
-
-                    # Also grab visible text near any tooltip/popover that appeared
-                    body_text_after = await page.inner_text("body")
-                    result["body_text_after_click"] = body_text_after[:1500]
+                    await page.wait_for_timeout(1500)
+                    # Any network requests fired by the click, matching the
+                    # site's own domain - this catches an API call carrying
+                    # the link even if nothing visible changed.
+                    result["network_requests_during_click"] = [
+                        url for url in network_hits if "corteconti.it" in url
+                    ][:20]
                 except Exception as e:
                     result["citazione_click_error"] = str(e)
+
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            await browser.close()
+
+    return JSONResponse(result)
+
+
+@app.get("/inspect_iframe_links")
+async def inspect_iframe_links(q: str = "accesso agli atti appalti"):
+    """The user found the real link by right-clicking -> 'copy link address',
+    meaning it's a genuine <a href> somewhere - but our searches of the main
+    page's HTML never found it. Most likely explanation: the PDF viewer is
+    rendered inside an <iframe>, which is a separate document our earlier
+    searches never looked inside. This checks every iframe directly."""
+    result = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        try:
+            await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            await page.fill("#inputRicerca", q)
+            await page.click("#buttonSearch")
+            await page.wait_for_selector(
+                'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
+                timeout=20000
+            )
+            detail_buttons = page.locator(
+                'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
+            )
+            await detail_buttons.nth(0).click()
+            try:
+                await page.wait_for_selector("text=Identificativo locale", timeout=15000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2000)
+
+            # List every iframe on the page
+            iframe_count = await page.locator("iframe").count()
+            result["iframe_count"] = iframe_count
+
+            iframe_details = []
+            for i in range(iframe_count):
+                detail = {"index": i}
+                try:
+                    frame_el = page.locator("iframe").nth(i)
+                    detail["src_attribute"] = await frame_el.get_attribute("src")
+
+                    frame = await frame_el.content_frame()
+                    if frame:
+                        links = await frame.eval_on_selector_all(
+                            "a[href]",
+                            "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText}))"
+                        )
+                        detail["links_inside_iframe"] = links
+                    else:
+                        detail["error"] = "Could not access iframe content (cross-origin or not loaded)"
+                except Exception as e:
+                    detail["error"] = str(e)
+                iframe_details.append(detail)
+
+            result["iframes"] = iframe_details
 
         except Exception as e:
             result["error"] = str(e)

@@ -354,7 +354,24 @@ async def inspect_citation_link(q: str = "accesso agli atti appalti"):
             if await citazione_el.count() > 0:
                 try:
                     await citazione_el.first.click()
-                    await page.wait_for_timeout(1500)
+
+                    # Check for a brief toast/confirmation popup right away,
+                    # before it might disappear
+                    await page.wait_for_timeout(300)
+                    toast_candidates = await page.eval_on_selector_all(
+                        '[class*="toast"], [class*="snack"], [class*="notification"], [role="alert"]',
+                        "els => els.map(e => e.innerText).filter(t => t && t.trim())"
+                    )
+                    result["toast_text_immediately_after_click"] = toast_candidates
+
+                    # The actual likely answer: read the clipboard directly
+                    try:
+                        clipboard_text = await page.evaluate("() => navigator.clipboard.readText()")
+                        result["clipboard_content_after_click"] = clipboard_text
+                    except Exception as e:
+                        result["clipboard_read_error"] = str(e)
+
+                    await page.wait_for_timeout(1200)
                     html_after = await page.content()
                     uuids_found_after = list(set(uuid_pattern.findall(html_after)))
                     result["uuids_in_html_after_clicking_citazione"] = uuids_found_after

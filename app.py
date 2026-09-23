@@ -93,8 +93,28 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                 if count == 0:
                     await page.wait_for_timeout(2000)
                     count = await detail_buttons.count()
+
+                # If the requested result index isn't loaded yet, click
+                # "Carica altri risultati" (load more) repeatedly until it
+                # is, or until the button disappears (no more to load).
+                load_more_attempts = 0
+                while i >= count and load_more_attempts < 8:
+                    load_more = page.locator(
+                        'button:has-text("Carica altri risultati"), '
+                        'a:has-text("Carica altri risultati")'
+                    )
+                    if await load_more.count() == 0:
+                        break  # no load-more control found - nothing more to load
+                    try:
+                        await load_more.first.click()
+                        await page.wait_for_timeout(2500)
+                    except Exception:
+                        break
+                    count = await detail_buttons.count()
+                    load_more_attempts += 1
+
                 if i >= count:
-                    errors.append(f"Result {i}: only {count} results available on this page")
+                    errors.append(f"Result {i}: only {count} results available even after loading more")
                     break
 
                 # Capture the source document's real URL via the "Scarica
@@ -103,6 +123,7 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                 # has to happen first, on the same page, to avoid a whole
                 # extra reload cycle.
                 fonte_url = None
+                fonte_url_error = None
                 try:
                     download_buttons = page.locator(
                         'app-cmp-pag-table-cdc tr.parent button[title^="Scarica allegato"]'
@@ -112,8 +133,8 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                     download = await download_info.value
                     fonte_url = download.url
                     await download.cancel()
-                except Exception:
-                    pass  # not fatal - result still gets extracted, just without a source link
+                except Exception as e:
+                    fonte_url_error = str(e)  # not fatal - captured for diagnosis instead of hidden
 
                 await detail_buttons.nth(i).click()
                 try:
@@ -144,7 +165,10 @@ async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dat
                     "organo_emittente": organo,
                     "testo_completo": testo,
                     "fonte_url": fonte_url,
+                    "fonte_url_error": fonte_url_error,
                 })
+                if fonte_url_error:
+                    errors.append(f"Result {i}: source link capture failed - {fonte_url_error}")
 
             except Exception as e:
                 errors.append(f"Result {i}: {str(e)}")

@@ -46,140 +46,153 @@ async def safe(coro, default=None):
 
 
 async def extract_results(q: str, n: int, banca_dati: str = "Tutte le banche dati") -> dict:
-    """Core extraction loop: for each of the first n results, load the
-    search fresh, click into that specific result, and grab the full text.
-    Re-runs the search per result rather than navigating 'back' from the
-    document viewer, since no reliable back-navigation method is known yet.
-
-    banca_dati: one of "Tutte le banche dati", "Giurisdizione", "Controllo" -
-    filters at the source via the site's own dropdown, confirmed to exist
-    via /inspect_dropdowns."""
+    """Core extraction: search ONCE, then for each result, open it, extract
+    its text, and return to the results list (browser back-navigation,
+    falling back to re-clicking search if that doesn't work) instead of
+    reloading the whole search from scratch every time - this is the main
+    speed fix over the earlier version."""
     extracted = []
     errors = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
 
-        for i in range(n):
-            page = await browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        try:
+            await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+
+            if banca_dati != "Tutte le banche dati":
+                try:
+                    await page.locator("mat-select").nth(0).click()
+                    await page.wait_for_timeout(500)
+                    await page.locator("mat-option", has_text=banca_dati).click()
+                    await page.wait_for_timeout(500)
+                except Exception as e:
+                    errors.append(f"Could not set banca_dati filter to '{banca_dati}': {e}")
+
+            await page.fill("#inputRicerca", q)
+            await page.click("#buttonSearch")
+            await page.wait_for_selector(
+                'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
+                timeout=20000
             )
-            try:
-                await page.goto(TARGET_URL, timeout=30000, wait_until="networkidle")
+            await page.wait_for_timeout(800)
 
-                if banca_dati != "Tutte le banche dati":
-                    try:
-                        await page.locator("mat-select").nth(0).click()
-                        await page.wait_for_timeout(500)
-                        await page.locator("mat-option", has_text=banca_dati).click()
-                        await page.wait_for_timeout(500)
-                    except Exception as e:
-                        errors.append(f"Could not set banca_dati filter to '{banca_dati}': {e}")
+            detail_buttons = page.locator(
+                'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
+            )
+            download_buttons = page.locator(
+                'app-cmp-pag-table-cdc tr.parent button[title^="Scarica allegato"]'
+            )
 
-                await page.fill("#inputRicerca", q)
-                await page.click("#buttonSearch")
-
-                await page.wait_for_selector(
-                    'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
-                    timeout=20000
-                )
-                await page.wait_for_timeout(800)
-
-                detail_buttons = page.locator(
-                    'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]'
-                )
-                count = await detail_buttons.count()
-                if count == 0:
-                    await page.wait_for_timeout(2000)
+            for i in range(n):
+                try:
                     count = await detail_buttons.count()
+                    load_more_attempts = 0
+                    while i >= count and load_more_attempts < 8:
+                        load_more = page.locator(
+                            'button:has-text("Carica altri risultati"), '
+                            'a:has-text("Carica altri risultati")'
+                        )
+                        if await load_more.count() == 0:
+                            break
+                        try:
+                            await load_more.first.click()
+                            await page.wait_for_timeout(2500)
+                        except Exception:
+                            break
+                        count = await detail_buttons.count()
+                        load_more_attempts += 1
 
-                # If the requested result index isn't loaded yet, click
-                # "Carica altri risultati" (load more) repeatedly until it
-                # is, or until the button disappears (no more to load).
-                load_more_attempts = 0
-                while i >= count and load_more_attempts < 8:
-                    load_more = page.locator(
-                        'button:has-text("Carica altri risultati"), '
-                        'a:has-text("Carica altri risultati")'
-                    )
-                    if await load_more.count() == 0:
-                        break  # no load-more control found - nothing more to load
-                    try:
-                        await load_more.first.click()
-                        await page.wait_for_timeout(2500)
-                    except Exception:
+                    if i >= count:
+                        errors.append(f"Result {i}: only {count} results available even after loading more")
                         break
-                    count = await detail_buttons.count()
-                    load_more_attempts += 1
 
-                if i >= count:
-                    errors.append(f"Result {i}: only {count} results available even after loading more")
+                    fonte_url = None
+                    fonte_url_error = None
+                    try:
+                        async with page.expect_download(timeout=8000) as download_info:
+                            await download_buttons.nth(i).click()
+                        download = await download_info.value
+                        fonte_url = download.url
+                        await download.cancel()
+                    except Exception as e:
+                        fonte_url_error = str(e)
+
+                    await detail_buttons.nth(i).click()
+                    try:
+                        await page.wait_for_selector("text=Identificativo locale", timeout=15000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1000)
+
+                    full_text = await page.inner_text("body")
+
+                    def extract_field(label, next_label, text):
+                        pattern = re.escape(label) + r"\s*\n+(.*?)\n+\s*" + re.escape(next_label)
+                        match = re.search(pattern, text, re.DOTALL)
+                        return match.group(1).strip() if match else None
+
+                    identificativo = extract_field("Identificativo locale", "Organo emittente", full_text)
+                    organo = extract_field("Organo emittente", "Attiva riferimenti", full_text)
+
+                    testo_match = re.search(r"TESTO PROVVEDIMENTO\s*\n+(.*)", full_text, re.DOTALL)
+                    testo = testo_match.group(1).strip() if testo_match else full_text
+
+                    extracted.append({
+                        "result_index": i,
+                        "identificativo_locale": identificativo,
+                        "organo_emittente": organo,
+                        "testo_completo": testo,
+                        "fonte_url": fonte_url,
+                        "fonte_url_error": fonte_url_error,
+                    })
+                    if fonte_url_error:
+                        errors.append(f"Result {i}: source link capture failed - {fonte_url_error}")
+
+                    # Return to the results list for the next result instead
+                    # of reloading the whole search - the actual speed fix.
+                    # Try browser back-navigation first; if the Angular app
+                    # didn't push a real history entry, fall back to
+                    # re-clicking the search button (still much cheaper
+                    # than a full page.goto() reload).
+                    if i < n - 1:
+                        went_back_ok = False
+                        try:
+                            await page.go_back(timeout=8000)
+                            await page.wait_for_selector(
+                                'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
+                                timeout=8000
+                            )
+                            went_back_ok = True
+                        except Exception:
+                            pass
+
+                        if not went_back_ok:
+                            try:
+                                await page.click("#buttonSearch")
+                                await page.wait_for_selector(
+                                    'app-cmp-pag-table-cdc tr.parent button[title="Vai al dettaglio"]',
+                                    timeout=15000
+                                )
+                            except Exception as e:
+                                errors.append(f"Result {i}: could not return to results list - {e}")
+                                break
+
+                except Exception as e:
+                    errors.append(f"Result {i}: {str(e)}")
                     break
 
-                # Capture the source document's real URL via the "Scarica
-                # allegato" (download) button BEFORE opening the in-app
-                # viewer - the viewer replaces this row's content, so this
-                # has to happen first, on the same page, to avoid a whole
-                # extra reload cycle.
-                fonte_url = None
-                fonte_url_error = None
-                try:
-                    download_buttons = page.locator(
-                        'app-cmp-pag-table-cdc tr.parent button[title^="Scarica allegato"]'
-                    )
-                    async with page.expect_download(timeout=8000) as download_info:
-                        await download_buttons.nth(i).click()
-                    download = await download_info.value
-                    fonte_url = download.url
-                    await download.cancel()
-                except Exception as e:
-                    fonte_url_error = str(e)  # not fatal - captured for diagnosis instead of hidden
-
-                await detail_buttons.nth(i).click()
-                try:
-                    await page.wait_for_selector("text=Identificativo locale", timeout=15000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1000)
-
-                full_text = await page.inner_text("body")
-
-                # Best-effort structured fields when present (delibere have
-                # them; sentenze often don't - that's fine, Claude reads the
-                # raw text either way).
-                def extract_field(label, next_label, text):
-                    pattern = re.escape(label) + r"\s*\n+(.*?)\n+\s*" + re.escape(next_label)
-                    match = re.search(pattern, text, re.DOTALL)
-                    return match.group(1).strip() if match else None
-
-                identificativo = extract_field("Identificativo locale", "Organo emittente", full_text)
-                organo = extract_field("Organo emittente", "Attiva riferimenti", full_text)
-
-                testo_match = re.search(r"TESTO PROVVEDIMENTO\s*\n+(.*)", full_text, re.DOTALL)
-                testo = testo_match.group(1).strip() if testo_match else full_text
-
-                extracted.append({
-                    "result_index": i,
-                    "identificativo_locale": identificativo,
-                    "organo_emittente": organo,
-                    "testo_completo": testo,
-                    "fonte_url": fonte_url,
-                    "fonte_url_error": fonte_url_error,
-                })
-                if fonte_url_error:
-                    errors.append(f"Result {i}: source link capture failed - {fonte_url_error}")
-
-            except Exception as e:
-                errors.append(f"Result {i}: {str(e)}")
-            finally:
-                await page.close()
-
-        await browser.close()
+        except Exception as e:
+            errors.append(f"Setup error: {str(e)}")
+        finally:
+            await page.close()
+            await browser.close()
 
     return {"extracted": extracted, "errors": errors}
-
-
 async def run_search_job(job_id: str, q: str, n: int, banca_dati: str = "Tutte le banche dati"):
     """The actual work, run in the background - not tied to any single
     HTTP request's lifetime, so it can take as long as it needs."""
